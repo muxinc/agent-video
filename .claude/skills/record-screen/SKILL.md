@@ -29,7 +29,7 @@ Use the `narrator.sh` helper script at `bin/narrator.sh`. The browser stays open
 ./bin/narrator.sh init "roast"  # or any persona name
 ```
 
-### 2. Navigate to First URL and Start Timer
+### 2. Navigate to First URL, Resize, and Start Timer
 
 ```
 browser_navigate to the first URL
@@ -37,7 +37,15 @@ browser_navigate to the first URL
 
 Recording starts automatically when the browser opens.
 
-**IMMEDIATELY after browser opens**, log the start time:
+**Resize the browser to fill the video frame:**
+
+```
+browser_resize width=1280 height=720
+```
+
+This ensures the browser fills the entire 16:9 video.
+
+**Then IMMEDIATELY log the start time:**
 
 ```bash
 ./bin/narrator.sh start
@@ -113,7 +121,8 @@ Returns the playback URL.
 ./bin/narrator.sh init "roast"
 
 browser_navigate → https://mux.com
-./bin/narrator.sh start  ← IMMEDIATELY after browser opens
+browser_resize width=1280 height=720  ← fill the video frame
+./bin/narrator.sh start
 
 # Page 1: Homepage
 browser_snapshot → (see the page, generate commentary)

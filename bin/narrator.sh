@@ -184,8 +184,14 @@ cmd_mark() {
         exit 1
     fi
 
-    # Save mark
-    echo "$clip_num $offset_ms $duration_ms" >> "$session_dir/marks.txt"
+    # Validate all values before saving
+    if [[ -z "$clip_num" || -z "$offset_ms" || -z "$duration_ms" ]]; then
+        echo -e "${RED}Error:${NC} Missing values - clip:$clip_num offset:$offset_ms duration:$duration_ms"
+        exit 1
+    fi
+
+    # Save mark using printf for reliable formatting
+    printf "%s %s %s\n" "$clip_num" "$offset_ms" "$duration_ms" >> "$session_dir/marks.txt"
 
     local offset_sec=$(echo "$offset_ms" | awk '{printf "%.2f", $1 / 1000}')
     local duration_sec=$(echo "$duration_ms" | awk '{printf "%.2f", $1 / 1000}')
