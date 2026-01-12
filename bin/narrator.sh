@@ -251,14 +251,25 @@ cmd_finalize() {
 
     > concat_list.txt
 
-    while IFS=' ' read -r num start_ms duration_ms; do
+    while read -r line; do
         # Skip comments and empty lines
-        [[ "$num" =~ ^#.*$ ]] && continue
-        [[ -z "$num" ]] && continue
+        [[ "$line" =~ ^#.*$ ]] && continue
+        [[ -z "$line" ]] && continue
+
+        # Parse fields using awk (more robust)
+        local num=$(echo "$line" | awk '{print $1}')
+        local start_ms=$(echo "$line" | awk '{print $2}')
+        local duration_ms=$(echo "$line" | awk '{print $3}')
+
+        # Validate we have all fields
+        if [[ -z "$num" || -z "$start_ms" || -z "$duration_ms" ]]; then
+            echo "  Skipping malformed line: $line"
+            continue
+        fi
 
         # Convert ms to seconds
-        local start_sec=$(awk "BEGIN {printf \"%.3f\", $start_ms / 1000}")
-        local duration_sec=$(awk "BEGIN {printf \"%.3f\", $duration_ms / 1000}")
+        local start_sec=$(echo "$start_ms" | awk '{printf "%.3f", $1 / 1000}')
+        local duration_sec=$(echo "$duration_ms" | awk '{printf "%.3f", $1 / 1000}')
 
         local end_sec=$(echo "$start_sec $duration_sec" | awk '{printf "%.3f", $1 + $2}')
         echo "  Extracting segment $num: ${start_sec}s to ${end_sec}s (${duration_sec}s)"
