@@ -184,7 +184,7 @@ async function createNarratedRecording(persona, pages) {
   try {
     // Navigate to first page
     console.error(`[narrator] Navigating to first page: ${pages[0].url}`);
-    await page.goto(pages[0].url, { waitUntil: "networkidle" });
+    await page.goto(pages[0].url, { waitUntil: "load" });
     await page.waitForTimeout(500); // Brief settle
 
     // Process each page
@@ -196,7 +196,7 @@ async function createNarratedRecording(persona, pages) {
 
       // Navigate if not first page
       if (i > 0) {
-        await page.goto(url, { waitUntil: "networkidle" });
+        await page.goto(url, { waitUntil: "load" });
         await page.waitForTimeout(500);
       }
 
@@ -212,27 +212,43 @@ async function createNarratedRecording(persona, pages) {
       marks.push({ clipNum, offsetMs, durationMs });
       console.error(`[narrator] Marked clip ${clipNum} at offset ${offsetMs}ms`);
 
-      // Smooth scroll animation during narration
-      const scrollDistance = 150;
-      const scrollTime = durationMs * 0.25;
-      const pauseTime = durationMs * 0.50;
-      const steps = 20;
-      const stepDelay = scrollTime / steps;
-      const stepDistance = scrollDistance / steps;
+      // Smooth scroll animation during narration - explore down the page
+      // Scroll further to make it feel like the agent is really exploring
+      const viewportHeight = 720;
+      const scrollDistance = viewportHeight * 1.5; // Scroll 1.5x viewport height
+      const numScrollSteps = 3; // Break into multiple smooth scroll steps
+      const scrollPerStep = scrollDistance / numScrollSteps;
 
-      // Scroll down (25% of duration)
-      for (let s = 0; s < steps; s++) {
-        await page.evaluate((y) => window.scrollBy(0, y), stepDistance);
-        await page.waitForTimeout(stepDelay);
-      }
+      // Reserve time for initial pause at top before scrolling
+      const initialPauseMs = 2000; // 2 seconds to view the top of the page
+      const scrollingTimeMs = Math.max(durationMs - initialPauseMs, durationMs * 0.5);
+      const timePerStep = scrollingTimeMs / numScrollSteps;
 
-      // Pause in middle (50% of duration)
-      await page.waitForTimeout(pauseTime);
+      // Inject smooth scroll CSS
+      await page.evaluate(() => {
+        document.documentElement.style.scrollBehavior = 'smooth';
+      });
 
-      // Scroll back up (25% of duration)
-      for (let s = 0; s < steps; s++) {
-        await page.evaluate((y) => window.scrollBy(0, y), -stepDistance);
-        await page.waitForTimeout(stepDelay);
+      // Pause at the top so viewers can see the page first
+      console.error(`[narrator] Pausing ${initialPauseMs}ms at top of page...`);
+      await page.waitForTimeout(initialPauseMs);
+
+      // Get current scroll position
+      let currentY = await page.evaluate(() => window.scrollY);
+
+      // Perform multiple scroll steps to explore the page
+      for (let step = 0; step < numScrollSteps; step++) {
+        const targetY = currentY + scrollPerStep;
+
+        await page.evaluate((target) => {
+          window.scrollTo({ top: target, behavior: 'smooth' });
+        }, targetY);
+
+        // Wait for scroll animation and pause to "read" the content
+        await page.waitForTimeout(timePerStep * 0.4); // 40% for scroll animation
+        await page.waitForTimeout(timePerStep * 0.6); // 60% pause to observe
+
+        currentY = targetY;
       }
 
       console.error(`[narrator] Completed segment ${clipNum}`);
