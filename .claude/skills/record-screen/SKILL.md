@@ -1,219 +1,78 @@
 ---
 name: record-screen
-description: Record screen activity and upload to Mux for sharing. Use when you need to capture what's happening on screen, record yourself completing a task, create video demos, or provide proof of work. Works with Playwright for browser recording. Can add AI-generated voice narration with different personas.
+description: Record screen activity and upload to Mux for sharing. Use when you need to capture what's happening on screen, record yourself completing a task, create video demos, or provide proof of work. Can add AI-generated voice narration with different personas.
 ---
 
-# Screen Recording for Agents
+# Screen Recording with Narration
 
-Record browser activity with optional voice narration and upload to Mux.
+Create narrated screen recordings using the `create_narrated_recording` MCP tool.
 
 ## How It Works
 
-The Playwright MCP is configured with `--save-video=1280x720`. Browser sessions are recorded to `~/Movies/agent-recordings/videos/`.
+The tool opens a browser, visits each page you specify, generates AI voice narration for each page, records with smooth scrolling animation, and uploads the final video to Mux.
 
-## Basic Recording (No Narration)
+**One tool call does everything.** No multi-step workflows.
 
-1. `browser_navigate` to URLs
-2. `browser_click`, `browser_type`, `browser_snapshot` to interact
-3. `browser_close` to end session
+## Usage
 
-Video saves automatically when browser closes.
+Call the `create_narrated_recording` tool with:
 
-## Recording with Voice Narration
+1. **persona**: The character/style for narration
+2. **pages**: Array of `{url, narration}` objects
 
-Use the `narrator.sh` helper script at `bin/narrator.sh`. The browser stays open for one continuous recording. Dead time (thinking, API calls) is cut out in post-production.
+### Example Tool Call
 
-### 1. Initialize Session
-
-```bash
-./bin/narrator.sh init "roast"  # or any persona name
+```json
+{
+  "persona": "roast",
+  "pages": [
+    {
+      "url": "https://mux.com",
+      "narration": "Well well well, another video API. Let's see what they've got here."
+    },
+    {
+      "url": "https://mux.com/pricing",
+      "narration": "Ah, the pricing page. Everyone's favorite destination."
+    }
+  ]
+}
 ```
 
-### 2. Navigate to First URL, Resize, and Start Timer
-
-```
-browser_navigate to the first URL
-```
-
-Recording starts automatically when the browser opens.
-
-**Resize the browser to fill the video frame:**
-
-```
-browser_resize width=1280 height=720
-```
-
-This ensures the browser fills the entire 16:9 video.
-
-**Then IMMEDIATELY log the start time:**
-
-```bash
-./bin/narrator.sh start
-```
-
-This syncs our timestamps with the video timeline. Must be called before any `mark` commands.
-
-### 3. For Each Page
-
-Repeat this cycle for each page:
-
-**Step A: Take snapshot and analyze**
-```
-browser_snapshot
-```
-Look at the page. Generate your commentary based on what you see.
-
-**Step B: Generate audio**
-```bash
-./bin/narrator.sh audio 1 "Your witty commentary here"
-```
-This calls ElevenLabs and returns the duration (e.g., 3.2s).
-
-**Step C: Mark the timestamp**
-```bash
-./bin/narrator.sh mark 1
-```
-This logs the current time as the START of the good segment. Call this RIGHT BEFORE waiting.
-
-**Step D: Wait for the audio duration**
-```
-browser_wait_for time=17.69
-```
-Use a SINGLE wait call matching the audio duration. Multiple scroll/wait cycles add overhead that breaks timing sync.
-
-**Step E: Navigate to next page (or close if done)**
-```
-browser_navigate to next URL
-```
-The time between pages (thinking, API calls) will be cut out.
-
-### 4. Close Browser
-
-```
-browser_close
-```
-
-### 5. Save the Recording
-
-```bash
-./bin/narrator.sh video
-```
-
-### 6. Finalize
-
-```bash
-./bin/narrator.sh finalize
-```
-
-This extracts only the "good" segments (the wait times after each mark), concatenates them, and overlays the audio.
-
-### 7. Upload to Mux
-
-```bash
-./bin/narrator.sh upload
-```
-
-Returns the playback URL.
-
-## Complete Example
-
-```
-./bin/narrator.sh init "roast"
-
-browser_navigate → https://mux.com
-browser_resize width=1280 height=720  ← fill the video frame
-./bin/narrator.sh start
-
-# Page 1: Homepage
-browser_snapshot → (see the page, generate commentary)
-./bin/narrator.sh audio 1 "Well well well, another video API..."
-./bin/narrator.sh mark 1
-browser_wait_for time=3.2  ← SINGLE wait matching audio duration
-
-browser_navigate → https://mux.com/pricing
-
-# Page 2: Pricing
-browser_snapshot → (analyze pricing)
-./bin/narrator.sh audio 2 "Ah, the pricing page. My favorite..."
-./bin/narrator.sh mark 2
-browser_wait_for time=2.8
-
-browser_navigate → https://mux.com/player
-
-# Page 3: Player
-browser_snapshot → (analyze features)
-./bin/narrator.sh audio 3 "Ooh, a player. Fancy..."
-./bin/narrator.sh mark 3
-browser_wait_for time=2.1
-
-browser_close
-
-./bin/narrator.sh video
-./bin/narrator.sh finalize
-./bin/narrator.sh upload
-```
-
-## How Segment Extraction Works
-
-The recording captures everything, including dead time:
-
-```
-[Recording timeline]
-0:00 - browser_navigate (video recording starts)
-0:01 - narrator.sh start called ← T0 baseline set here
-0:02 - Agent thinks, calls ElevenLabs (DEAD TIME - will be cut)
-0:15 - mark 1 called ← segment 1 starts at 14s in video (0:15 - 0:01)
-0:18 - wait ends ← segment 1 ends (3s of good video)
-0:18 - Navigate to page 2
-0:20 - Page 2 loads
-0:22 - Agent thinks, calls ElevenLabs (DEAD TIME - will be cut)
-0:35 - mark 2 called ← segment 2 starts at 34s in video (0:35 - 0:01)
-0:38 - wait ends ← segment 2 ends (3s of good video)
-...
-```
-
-The `start` command sets the baseline timestamp (T0). All `mark` offsets are calculated relative to this, so they align with the actual video timeline.
-
-Finalize extracts segments [14s-17s], [34s-37s], etc. and concatenates them.
+The tool returns a Mux playback URL like `https://stream.mux.com/abc123`.
 
 ## Personas
 
-**Interested Prospect**: "Ooh, what's this? A video API? Let me see what they've got..."
+Choose a persona that matches the desired narration style:
 
-**Roast Mode**: "Wow, another hero section with a gradient. How delightfully 2019."
+- **roast**: Sarcastic critique. "Wow, another hero section with a gradient. How delightfully 2019."
+- **interested prospect**: Curious exploration. "Ooh, what's this? Let me see what they've got..."
+- **noir detective**: Dramatic storytelling. "The pricing page. I'd seen a thousand like it. But something felt different..."
+- **excited intern**: Enthusiastic discovery. "Oh my gosh, THIS is where the analytics are! This is so cool!"
+- **caveman**: Simple observations. "Me click button. Page change. Many word. Me confused."
 
-**Caveman**: "Me click button. Page change. Many word. Me confused."
+## Example Prompts
 
-**Noir Detective**: "The pricing page. I'd seen a thousand like it. But something felt different..."
+> "Record mux.com with the roast persona. Visit homepage and pricing."
 
-**Excited Intern**: "Oh my gosh, THIS is where the analytics are! This is so cool!"
+> "Create a noir detective walkthrough of stripe.com/docs"
 
-## Example Prompt
+> "Record yourself exploring vercel.com as an excited intern"
 
-> "Create a narrated screen recording of mux.com in 'roast mode' persona. Visit the homepage, pricing, and player pages. Use narrator.sh to manage the session. Finalize and upload to Mux. Give me the link."
+## What the Tool Does Internally
 
-## Helper Script Reference
+1. Launches a browser with video recording enabled (1280x720)
+2. For each page:
+   - Navigates to the URL
+   - Generates audio via ElevenLabs text-to-speech
+   - Records a scrolling animation timed to the audio duration
+3. Closes browser
+4. Extracts video segments and merges with audio using ffmpeg
+5. Uploads final video to Mux
+6. Returns the playback URL
 
-```
-narrator.sh <command> [args]
+## Requirements
 
-Commands:
-  init [persona]         Initialize new session
-  start                  Log video start time (call RIGHT AFTER browser opens)
-  audio <num> "text"     Generate audio clip (calls ElevenLabs, returns duration)
-  mark <num>             Mark timestamp (start of good segment)
-  video                  Save the recording
-  status                 Show session status
-  finalize               Extract segments, merge audio
-  upload [video.mp4]     Upload to Mux
-```
-
-## Environment Variables
-
-Required for upload:
-- `MUX_TOKEN_ID`
-- `MUX_TOKEN_SECRET`
-
-Required for narration:
-- `ELEVENLABS_API_KEY`
-- `ELEVENLABS_VOICE_ID` (optional, has default)
+Environment variables must be set:
+- `ELEVENLABS_API_KEY` - For voice generation
+- `MUX_TOKEN_ID` - For video upload
+- `MUX_TOKEN_SECRET` - For video upload

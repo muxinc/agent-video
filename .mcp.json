@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "narrator": {
+      "command": "node",
+      "args": ["/Users/davekiss/Code/Mux/agent-video/mcp-server/index.js"]
+    }
+  }
+}

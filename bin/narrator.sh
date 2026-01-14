@@ -468,6 +468,58 @@ cmd_status() {
     [[ -f "$session_dir/output.mp4" ]] && echo -e "Output: ${GREEN}ready${NC}" || echo -e "Output: ${RED}not ready${NC}"
 }
 
+cmd_animate() {
+    local clip_num="$1"
+
+    if [[ -z "$clip_num" ]]; then
+        echo -e "${RED}Error:${NC} Usage: narrator.sh animate <clip_num>"
+        exit 1
+    fi
+
+    local session_dir=$(cat "$SESSION_FILE" 2>/dev/null)
+    if [[ -z "$session_dir" || ! -d "$session_dir" ]]; then
+        echo -e "${RED}Error:${NC} No active session."
+        exit 1
+    fi
+
+    local duration_ms=$(cat "$session_dir/clip_${clip_num}_duration_ms.txt" 2>/dev/null)
+    if [[ -z "$duration_ms" ]]; then
+        echo -e "${RED}Error:${NC} No duration found for clip $clip_num. Run 'audio $clip_num' first."
+        exit 1
+    fi
+
+    # Output the JavaScript for browser_run_code
+    cat << EOF
+async (page) => {
+  const duration = ${duration_ms};
+  const scrollDistance = 150;
+  const scrollTime = duration * 0.25;
+  const pauseTime = duration * 0.50;
+  const steps = 20;
+  const stepDelay = scrollTime / steps;
+  const stepDistance = scrollDistance / steps;
+
+  // Smooth scroll down (25% of duration)
+  for (let i = 0; i < steps; i++) {
+    await page.evaluate((y) => window.scrollBy(0, y), stepDistance);
+    await page.waitForTimeout(stepDelay);
+  }
+
+  // Pause in middle (50% of duration)
+  await page.waitForTimeout(pauseTime);
+
+  // Smooth scroll back up (25% of duration)
+  for (let i = 0; i < steps; i++) {
+    await page.evaluate((y) => window.scrollBy(0, y), -stepDistance);
+    await page.waitForTimeout(stepDelay);
+  }
+}
+EOF
+
+    echo ""
+    echo -e "${BLUE}Use with:${NC} browser_run_code with the above code"
+}
+
 cmd_help() {
     echo "Narrator - Helper script for narrated screen recordings"
     echo ""
@@ -478,6 +530,7 @@ cmd_help() {
     echo "  start                  Log video start time (call RIGHT AFTER browser opens)"
     echo "  audio <num> \"text\"     Generate audio clip (calls ElevenLabs)"
     echo "  mark <num>             Mark timestamp for segment extraction"
+    echo "  animate <num>          Output scroll animation JS (use instead of wait)"
     echo "  video                  Save the recording"
     echo "  status                 Show session status"
     echo "  finalize               Extract segments, merge audio"
@@ -511,6 +564,7 @@ case "${1:-help}" in
     start)    cmd_start ;;
     audio)    cmd_audio "$2" "$3" ;;
     mark)     cmd_mark "$2" ;;
+    animate)  cmd_animate "$2" ;;
     video)    cmd_video ;;
     status)   cmd_status ;;
     finalize) cmd_finalize ;;
