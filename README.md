@@ -4,13 +4,13 @@ Give your AI agent the ability to record its screen and share video via Mux.
 
 ## What This Does
 
-An agent can:
-1. Navigate a browser with Playwright (video records automatically)
-2. Add voice narration in a persona (optional, via ElevenLabs)
-3. Close the browser to finalize the recording
-4. Merge audio narration onto video
-5. Upload to Mux
-6. Return a shareable playback URL
+An MCP server that creates narrated screen recordings using a two-pass approach:
+
+1. **Research pass** - Visits each page, analyzes the content, and generates contextual narration using Claude
+2. **Performance pass** - Records smooth scroll animations timed to the generated audio
+3. **Post-production** - Merges audio with video and uploads to Mux
+
+The narration is based on what the tool actually sees on each page, so commentary is always relevant and contextual.
 
 **Use cases:**
 - Proof of work - agent shows exactly what it did
@@ -21,125 +21,116 @@ An agent can:
 
 ## Setup
 
-### 1. Install Playwright Plugin
+### 1. Install dependencies
 
-Ensure the Playwright plugin is installed in Claude Code. Then configure it for video recording by updating `~/.claude/plugins/cache/claude-plugins-official/playwright/<version>/.mcp.json`:
+```bash
+cd mcp-server
+npm install
+npx playwright install chromium
+```
+
+### 2. Set environment variables
+
+Create a `.env` file in the project root:
+
+```bash
+ANTHROPIC_API_KEY="your-api-key"
+ELEVENLABS_API_KEY="your-api-key"
+MUX_TOKEN_ID="your-token-id"
+MUX_TOKEN_SECRET="your-token-secret"
+```
+
+Get credentials from:
+- [Anthropic Console](https://console.anthropic.com) > API Keys (for narration generation)
+- [ElevenLabs](https://elevenlabs.io/app/settings/api-keys) > API Keys (for text-to-speech)
+- [Mux Dashboard](https://dashboard.mux.com) > Settings > API Access Tokens (for video hosting)
+
+### 3. Add to Claude Code settings
+
+Add this MCP server to your Claude Code configuration. Edit `~/.claude/settings.json` (global) or `.claude/settings.local.json` (project):
 
 ```json
 {
-  "playwright": {
-    "command": "npx",
-    "args": [
-      "@playwright/mcp@latest",
-      "--save-video=1280x720",
-      "--output-dir=/Users/YOU/Movies/agent-recordings"
-    ]
+  "mcpServers": {
+    "narrator": {
+      "command": "node",
+      "args": ["/path/to/agent-video/mcp-server/index.js"],
+      "env": {}
+    }
   }
 }
 ```
 
-Restart Claude Code after updating.
+Replace `/path/to/agent-video` with the actual path to this project.
 
-### 2. Set API Credentials
-
-Add to your shell profile (`~/.zshrc` or `~/.bashrc`):
-
-```bash
-# Mux (required)
-export MUX_TOKEN_ID="your-mux-token-id"
-export MUX_TOKEN_SECRET="your-mux-token-secret"
-
-# ElevenLabs (optional, for voice narration)
-export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
-export ELEVENLABS_VOICE_ID="JBFqnCBsd6RMkjVDRZzb"  # optional, has default
-```
-
-Then reload:
-```bash
-source ~/.zshrc
-```
-
-Get credentials from:
-- [Mux Dashboard](https://dashboard.mux.com) > Settings > API Access Tokens
-- [ElevenLabs](https://elevenlabs.io/app/settings/api-keys) > API Keys
-
-### 3. Create Output Directory
+### 4. Create output directory
 
 ```bash
 mkdir -p ~/Movies/agent-recordings
 ```
 
-### 4. Verify Setup
+## Tool: create_narrated_recording
 
-```bash
-# Check Mux credentials
-echo $MUX_TOKEN_ID
+Creates a narrated screen recording of web pages.
 
-# Check output directory exists
-ls ~/Movies/agent-recordings/
+### Parameters
+
+- `persona` (string, required): The character/style for narration. Can be anything you describe:
+  - "a sarcastic tech reviewer who's seen it all"
+  - "Gordon Ramsay reviewing websites"
+  - "a confused grandparent trying to understand the internet"
+  - "an overenthusiastic startup founder"
+
+- `pages` (array, required): Pages to visit
+  - `url` (string, required): The URL to visit
+  - `narration` (string, optional): Custom narration. If omitted, auto-generated based on page content.
+
+### Example (auto-generated narration)
+
+```json
+{
+  "persona": "a jaded Silicon Valley investor who's seen a thousand pitch decks",
+  "pages": [
+    { "url": "https://example.com" },
+    { "url": "https://example.com/about" },
+    { "url": "https://example.com/pricing" }
+  ]
+}
 ```
 
-## Usage
+### Example (custom narration)
 
-The skill at `.claude/skills/record-screen/SKILL.md` teaches the agent how to record and upload.
-
-Example prompts:
-
-**Basic recording:**
-> "Navigate to mux.com, click around, close the browser, upload the recording to Mux, and give me the link."
-
-**With narration:**
-> "Explore mux.com in 'roast mode' persona. First do a research pass to generate all the narration, then do a performance pass to record the video. Merge the audio and upload to Mux. Give me the link."
-
-### How Narrated Recording Works (Two-Pass Approach)
-
-To avoid dead air from agent thinking time, narrated recordings use two passes:
-
-1. **Pass 1 - Research**: Agent explores pages, generates commentary, calls ElevenLabs TTS to create audio clips. No video recording yet.
-2. **Pass 2 - Performance**: Agent replays the journey while recording. Pauses at each page for the exact duration of each audio clip.
-3. **Post-production**: ffmpeg merges audio clips onto video at the correct timestamps.
-
-The `bin/narrator.sh` helper script manages session state, audio generation, and timing synchronization.
-
-The agent will:
-1. Use Playwright to navigate and interact (video records automatically)
-2. Generate commentary and call ElevenLabs TTS (if narration requested)
-3. Pause for each narration's duration to sync timing
-4. Close the browser to finalize the video
-5. Merge audio clips onto video with ffmpeg
-6. Upload to Mux API
-7. Return the playback URL
-
-### Running Autonomously
-
-For fully autonomous operation without permission prompts, run Claude Code with:
-
-```bash
-claude --dangerously-skip-permissions
+```json
+{
+  "persona": "documentary narrator",
+  "pages": [
+    {
+      "url": "https://example.com",
+      "narration": "Here we observe the landing page in its natural habitat."
+    }
+  ]
+}
 ```
 
-This allows the agent to execute bash commands, use Playwright, and upload to Mux without asking for confirmation at each step. Only use this in trusted environments.
+### Returns
 
-## Files
-
-```
-.
-├── README.md
-├── bin/
-│   └── narrator.sh               # Helper script for narrated recordings
-└── .claude/
-    └── skills/
-        └── record-screen/
-            └── SKILL.md           # Screen recording skill
+```json
+{
+  "success": true,
+  "playbackUrl": "https://stream.mux.com/abc123",
+  "sessionDir": "/Users/.../session-123456",
+  "pagesRecorded": 3
+}
 ```
 
-### Making the Helper Script Executable
+## How It Works
 
-After cloning, make the narrator script executable:
-
-```bash
-chmod +x bin/narrator.sh
-```
+1. **Research pass**: Opens browser, visits each page, takes snapshots
+2. **Narration generation**: Sends snapshots to Claude API to generate contextual narration in the specified persona
+3. **Audio generation**: Converts narration to speech via ElevenLabs
+4. **Performance pass**: Opens browser again, records smooth scrolling timed to audio duration
+5. **Post-production**: Extracts segments, merges audio with precise timing via ffmpeg
+6. **Upload**: Sends final video to Mux, returns playback URL
 
 ## Why Mux?
 

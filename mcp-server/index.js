@@ -6,8 +6,7 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { chromium } from "playwright";
-import { execSync, exec } from "child_process";
+import { execSync, spawnSync } from "child_process";
 import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -15,6 +14,24 @@ import { fileURLToPath } from "url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = dirname(__dirname);
 const SESSION_BASE = join(process.env.HOME, "Movies", "agent-recordings");
+
+// Helper to run agent-browser commands
+function agentBrowser(command, options = {}) {
+  const fullCommand = `agent-browser ${command}`;
+  console.error(`[narrator] $ ${fullCommand}`);
+  try {
+    const result = execSync(fullCommand, {
+      encoding: "utf-8",
+      timeout: options.timeout || 30000,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return result.trim();
+  } catch (error) {
+    console.error(`[narrator] Command failed: ${error.message}`);
+    if (error.stderr) console.error(`[narrator] stderr: ${error.stderr}`);
+    throw error;
+  }
+}
 
 // Load environment variables
 function loadEnv() {
@@ -33,13 +50,130 @@ function loadEnv() {
 
 loadEnv();
 
-// Helper to get timestamp in ms
-function getTimestampMs() {
-  return Date.now();
+// Sleep helper
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Generate narration using Claude API - returns structured data with scroll cues
+async function generateNarration(persona, pageUrl, snapshot) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("ANTHROPIC_API_KEY not set - required for auto-generating narration");
+  }
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": apiKey,
+      "content-type": "application/json",
+      "anthropic-version": "2023-06-01",
+      "anthropic-beta": "structured-outputs-2025-11-13",
+    },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 800,
+      messages: [
+        {
+          role: "user",
+          content: `You are narrating a screen recording of a website visit. Your persona: ${persona}
+
+You are currently viewing: ${pageUrl}
+
+Here is the accessibility snapshot of the page (elements have ref IDs like @e1, @e5, @e12, etc.):
+${snapshot}
+
+Generate narration that flows naturally through the page from top to bottom. As you mention different parts of the page, we'll scroll to show them.
+
+Guidelines:
+- Create 3-5 segments that flow naturally as one continuous narration
+- Each segment should be 1-2 sentences
+- Start at the top of the page and work your way down
+- IMPORTANT: Use refs from the snapshot above (like @e1, @e5, @e12) for scrollTo - these are guaranteed to exist
+- Pick refs that correspond to what you're talking about in that segment (e.g. if talking about a heading, use its ref)
+- Use 'top' for the first segment, then refs for subsequent sections as you scroll down
+- Keep it natural and conversational - this will be converted to speech
+- Stay in character throughout`,
+        },
+      ],
+      output_format: {
+        type: "json_schema",
+        schema: {
+          type: "object",
+          properties: {
+            segments: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  text: {
+                    type: "string",
+                    description: "The spoken narration for this segment"
+                  },
+                  scrollTo: {
+                    type: "string",
+                    description: "Ref from the snapshot (e.g. @e1, @e5, @e12) or 'top'/'bottom'"
+                  }
+                },
+                required: ["text", "scrollTo"],
+                additionalProperties: false
+              }
+            }
+          },
+          required: ["segments"],
+          additionalProperties: false
+        }
+      }
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Claude API error: ${error}`);
+  }
+
+  const data = await response.json();
+
+  // With structured outputs, the response is guaranteed to be valid JSON
+  return JSON.parse(data.content[0].text);
+}
+
+// Calculate segment start times based on character positions in the full text
+function calculateSegmentTimings(segments, charStartTimes, characters) {
+  const fullText = segments.map(s => s.text).join(' ');
+  const segmentTimings = [];
+  let charOffset = 0;
+
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    const segmentText = segment.text;
+
+    // Find the start time for this segment
+    const startTime = charOffset < charStartTimes.length ? charStartTimes[charOffset] : 0;
+
+    // Calculate end position (add segment length + 1 for space)
+    const endCharOffset = charOffset + segmentText.length;
+    const endTime = endCharOffset < charStartTimes.length ? charStartTimes[endCharOffset] : charStartTimes[charStartTimes.length - 1];
+
+    segmentTimings.push({
+      text: segmentText,
+      scrollTo: segment.scrollTo,
+      startTimeSec: startTime,
+      endTimeSec: endTime,
+      startTimeMs: Math.round(startTime * 1000),
+      endTimeMs: Math.round(endTime * 1000),
+    });
+
+    // Move offset past this segment + space
+    charOffset = endCharOffset + 1;
+  }
+
+  return segmentTimings;
 }
 
 // Generate audio via ElevenLabs
-async function generateAudio(text, clipPath) {
+async function generateAudio(text, clipPath, segments = null) {
   const voiceId = process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb";
   const apiKey = process.env.ELEVENLABS_API_KEY;
 
@@ -73,13 +207,27 @@ async function generateAudio(text, clipPath) {
   const audioBuffer = Buffer.from(data.audio_base64, "base64");
   writeFileSync(clipPath, audioBuffer);
 
-  // Get duration from alignment data
-  const endTimes = data.alignment?.character_end_times_seconds || [];
-  const durationSec = endTimes.length > 0 ? endTimes[endTimes.length - 1] : 3;
+  // Get duration and timing alignment from response
+  const alignment = data.alignment || {};
+  const charStartTimes = alignment.character_start_times_seconds || [];
+  const charEndTimes = alignment.character_end_times_seconds || [];
+  const characters = alignment.characters || [];
+
+  console.error(`[narrator] ElevenLabs alignment: ${charStartTimes.length} char times`);
+
+  const durationSec = charEndTimes.length > 0 ? charEndTimes[charEndTimes.length - 1] : 3;
   const durationMs = Math.round(durationSec * 1000);
 
-  return { durationMs, durationSec };
+  // Calculate segment timings if segments provided
+  let segmentTimings = null;
+  if (segments && segments.length > 0) {
+    segmentTimings = calculateSegmentTimings(segments, charStartTimes, characters);
+    console.error(`[narrator] Segment timings calculated for ${segmentTimings.length} segments`);
+  }
+
+  return { durationMs, durationSec, charStartTimes, charEndTimes, characters, segmentTimings };
 }
+
 
 // Upload to Mux
 async function uploadToMux(videoPath) {
@@ -114,12 +262,12 @@ async function uploadToMux(videoPath) {
   const videoBuffer = readFileSync(videoPath);
   await fetch(uploadUrl, {
     method: "PUT",
-    headers: { "Content-Type": "video/mp4" },
+    headers: { "Content-Type": "video/webm" },
     body: videoBuffer,
   });
 
   // Wait for processing
-  await new Promise((r) => setTimeout(r, 5000));
+  await sleep(5000);
 
   // Get asset ID
   const uploadStatusResponse = await fetch(
@@ -148,134 +296,198 @@ async function uploadToMux(videoPath) {
   return `https://stream.mux.com/${playbackId}`;
 }
 
+
 // Main recording function
-async function createNarratedRecording(persona, pages) {
+async function createNarratedRecording(persona, pages, globalHighlightDefaults) {
   const sessionId = Date.now();
   const sessionDir = join(SESSION_BASE, `session-${sessionId}`);
   mkdirSync(sessionDir, { recursive: true });
-
-  // Ensure videos directory exists
-  const videosDir = join(SESSION_BASE, "videos");
-  mkdirSync(videosDir, { recursive: true });
 
   console.error(`[narrator] Starting session: ${sessionDir}`);
   console.error(`[narrator] Persona: ${persona}`);
   console.error(`[narrator] Pages: ${pages.length}`);
 
-  // Launch browser with video recording
-  const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext({
-    viewport: { width: 1280, height: 720 },
-    recordVideo: {
-      dir: videosDir,
-      size: { width: 1280, height: 720 },
-    },
-  });
-  const page = await context.newPage();
-
-  // Track marks for segment extraction
-  const marks = [];
+  // Video output path
+  const videoPath = join(sessionDir, "recording.webm");
   const clips = [];
-
-  // Set T0 baseline immediately when recording starts (before any navigation)
-  const recordingStartMs = getTimestampMs();
-  console.error(`[narrator] Recording started at T0: ${recordingStartMs}`);
+  const pageData = [];
 
   try {
-    // Navigate to first page
-    console.error(`[narrator] Navigating to first page: ${pages[0].url}`);
-    await page.goto(pages[0].url, { waitUntil: "load" });
-    await page.waitForTimeout(500); // Brief settle
+    // === RESEARCH PASS ===
+    // Visit each page, get snapshot, generate narration if not provided
+    console.error(`[narrator] === RESEARCH PASS ===`);
 
-    // Process each page
+    // Open browser for research
+    console.error(`[narrator] Opening browser for research...`);
+    agentBrowser(`set viewport 1280 720`);
+    agentBrowser(`open "${pages[0].url}" --headed`, { timeout: 60000 });
+    await sleep(2000);
+
     for (let i = 0; i < pages.length; i++) {
-      const { url, narration } = pages[i];
-      const clipNum = i + 1;
-
-      console.error(`[narrator] Processing page ${clipNum}: ${url}`);
+      const page = pages[i];
+      console.error(`[narrator] Researching page ${i + 1}: ${page.url}`);
 
       // Navigate if not first page
       if (i > 0) {
-        await page.goto(url, { waitUntil: "load" });
-        await page.waitForTimeout(500);
+        agentBrowser(`open "${page.url}"`, { timeout: 60000 });
+        await sleep(2000);
       }
 
-      // Generate audio
-      const clipPath = join(sessionDir, `clip_${clipNum}.mp3`);
-      console.error(`[narrator] Generating audio for clip ${clipNum}...`);
-      const { durationMs, durationSec } = await generateAudio(narration, clipPath);
-      console.error(`[narrator] Audio duration: ${durationSec}s`);
-      clips.push({ clipNum, durationMs, clipPath });
+      // Get snapshot of the page
+      console.error(`[narrator] Taking snapshot...`);
+      const snapshot = agentBrowser(`snapshot`);
 
-      // Mark timestamp (start of good segment)
-      const offsetMs = getTimestampMs() - recordingStartMs;
-      marks.push({ clipNum, offsetMs, durationMs });
+      // Generate narration
+      console.error(`[narrator] Generating narration with Claude...`);
+      const narrationData = await generateNarration(persona, page.url, snapshot);
+      console.error(`[narrator] Generated ${narrationData.segments.length} segments`);
+      for (const seg of narrationData.segments) {
+        console.error(`[narrator]   - "${seg.text.substring(0, 50)}..." -> ${seg.scrollTo}`);
+      }
+
+      pageData.push({
+        url: page.url,
+        narrationData,
+        highlights: page.highlights,
+        highlightDefaults: page.highlightDefaults,
+      });
+    }
+
+    // Close browser after research
+    console.error(`[narrator] Closing browser after research...`);
+    agentBrowser(`close`);
+    await sleep(1000);
+
+    // === AUDIO GENERATION ===
+    console.error(`[narrator] === GENERATING AUDIO ===`);
+    for (let i = 0; i < pageData.length; i++) {
+      const clipPath = join(sessionDir, `clip_${i + 1}.mp3`);
+      console.error(`[narrator] Generating audio for page ${i + 1}...`);
+
+      // Combine segment texts into full narration
+      const segments = pageData[i].narrationData.segments;
+      const fullNarration = segments.map(s => s.text).join(' ');
+
+      const audioData = await generateAudio(fullNarration, clipPath, segments);
+      clips.push({
+        clipNum: i + 1,
+        clipPath,
+        segments,
+        ...audioData
+      });
+      console.error(`[narrator] Audio duration: ${audioData.durationSec.toFixed(2)}s`);
+      if (audioData.segmentTimings) {
+        for (const st of audioData.segmentTimings) {
+          console.error(`[narrator]   Segment at ${st.startTimeSec.toFixed(2)}s: scroll to ${st.scrollTo}`);
+        }
+      }
+    }
+
+    // === PERFORMANCE PASS (RECORDING) ===
+    console.error(`[narrator] === PERFORMANCE PASS ===`);
+
+    // Set viewport
+    console.error(`[narrator] Setting viewport...`);
+    agentBrowser(`set viewport 1280 720`);
+
+    // Navigate to first page
+    console.error(`[narrator] Navigating to first page: ${pageData[0].url}`);
+    agentBrowser(`open "${pageData[0].url}" --headed`, { timeout: 60000 });
+    await sleep(2000);
+
+    // Start recording
+    console.error(`[narrator] Starting video recording: ${videoPath}`);
+    agentBrowser(`record start "${videoPath}"`);
+
+    const recordingStartMs = Date.now();
+    const marks = [];
+
+    // Process each page
+    for (let i = 0; i < pageData.length; i++) {
+      const { url, narrationData, highlights, highlightDefaults } = pageData[i];
+      const clipNum = i + 1;
+      const clip = clips[i];
+
+      console.error(`[narrator] Recording page ${clipNum}: ${url}`);
+
+      // Navigate if not first page
+      if (i > 0) {
+        agentBrowser(`open "${url}"`, { timeout: 60000 });
+        await sleep(1000);
+      }
+
+      // Mark timestamp
+      const offsetMs = Date.now() - recordingStartMs;
+      marks.push({ clipNum, offsetMs, durationMs: clip.durationMs });
       console.error(`[narrator] Marked clip ${clipNum} at offset ${offsetMs}ms`);
 
-      // Smooth scroll animation during narration - explore down the page
-      // Scroll further to make it feel like the agent is really exploring
-      const viewportHeight = 720;
-      const scrollDistance = viewportHeight * 1.5; // Scroll 1.5x viewport height
-      const numScrollSteps = 3; // Break into multiple smooth scroll steps
-      const scrollPerStep = scrollDistance / numScrollSteps;
+      // Enable smooth scrolling
+      agentBrowser(`eval "document.documentElement.style.scrollBehavior = 'smooth'"`);
 
-      // Reserve time for initial pause at top before scrolling
-      const initialPauseMs = 2000; // 2 seconds to view the top of the page
-      const scrollingTimeMs = Math.max(durationMs - initialPauseMs, durationMs * 0.5);
-      const timePerStep = scrollingTimeMs / numScrollSteps;
+      // Content-aware scrolling based on segment timings
+      if (clip.segmentTimings && clip.segmentTimings.length > 0) {
+        console.error(`[narrator] Using content-aware scrolling with ${clip.segmentTimings.length} segments`);
 
-      // Inject smooth scroll CSS
-      await page.evaluate(() => {
-        document.documentElement.style.scrollBehavior = 'smooth';
-      });
+        const segmentStartTime = Date.now();
 
-      // Pause at the top so viewers can see the page first
-      console.error(`[narrator] Pausing ${initialPauseMs}ms at top of page...`);
-      await page.waitForTimeout(initialPauseMs);
+        for (let segIdx = 0; segIdx < clip.segmentTimings.length; segIdx++) {
+          const segment = clip.segmentTimings[segIdx];
+          const targetScrollTo = segment.scrollTo;
 
-      // Get current scroll position
-      let currentY = await page.evaluate(() => window.scrollY);
+          // Wait until it's time to scroll to this segment
+          const elapsedMs = Date.now() - segmentStartTime;
+          const waitMs = segment.startTimeMs - elapsedMs;
+          if (waitMs > 0) {
+            await sleep(waitMs);
+          }
 
-      // Perform multiple scroll steps to explore the page
-      for (let step = 0; step < numScrollSteps; step++) {
-        const targetY = currentY + scrollPerStep;
+          console.error(`[narrator] Scrolling to: ${targetScrollTo}`);
 
-        await page.evaluate((target) => {
-          window.scrollTo({ top: target, behavior: 'smooth' });
-        }, targetY);
+          // Scroll to the target element/position
+          if (targetScrollTo === 'top') {
+            agentBrowser(`eval "window.scrollTo({ top: 0, behavior: 'smooth' })"`);
+          } else if (targetScrollTo === 'bottom') {
+            agentBrowser(`eval "window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })"`);
+          } else if (targetScrollTo.startsWith('@')) {
+            // Use ref-based scrolling (guaranteed to exist from snapshot)
+            try {
+              agentBrowser(`scrollintoview ${targetScrollTo}`);
+            } catch (e) {
+              console.error(`[narrator] Failed to scroll to ref ${targetScrollTo}: ${e.message}`);
+            }
+          } else {
+            // Fallback: try CSS selector (less reliable)
+            console.error(`[narrator] Warning: using CSS selector fallback for: ${targetScrollTo}`);
+            const escapedSelector = targetScrollTo.replace(/"/g, '\\"').replace(/'/g, "\\'");
+            agentBrowser(`eval "const el = document.querySelector('${escapedSelector}'); if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }"`);
+          }
+        }
 
-        // Wait for scroll animation and pause to "read" the content
-        await page.waitForTimeout(timePerStep * 0.4); // 40% for scroll animation
-        await page.waitForTimeout(timePerStep * 0.6); // 60% pause to observe
-
-        currentY = targetY;
+        // Wait for the rest of the audio duration
+        const totalElapsed = Date.now() - segmentStartTime;
+        const remainingMs = clip.durationMs - totalElapsed;
+        if (remainingMs > 0) {
+          await sleep(remainingMs);
+        }
+      } else {
+        // Fallback: simple timed scroll if no segment timings
+        console.error(`[narrator] Using fallback scrolling (no segment timings)`);
+        await sleep(clip.durationMs);
       }
 
       console.error(`[narrator] Completed segment ${clipNum}`);
     }
 
-    // Close browser to finalize video
+    // Stop recording
+    console.error(`[narrator] Stopping video recording...`);
+    agentBrowser(`record stop`);
+
+    // Close browser
     console.error(`[narrator] Closing browser...`);
-    await page.close();
-    await context.close();
-    await browser.close();
+    agentBrowser(`close`);
 
-    // Find the video file
-    await new Promise((r) => setTimeout(r, 1000)); // Wait for video to be written
-    const videoFiles = execSync(`ls -t "${videosDir}"/*.webm 2>/dev/null || true`)
-      .toString()
-      .trim()
-      .split("\n")
-      .filter(Boolean);
-
-    if (videoFiles.length === 0) {
-      throw new Error("No video file found");
-    }
-
-    const rawVideoPath = videoFiles[0];
-    const recordingPath = join(sessionDir, "recording.webm");
-    execSync(`mv "${rawVideoPath}" "${recordingPath}"`);
-    console.error(`[narrator] Video saved: ${recordingPath}`);
+    // Wait for video file to be written
+    await sleep(1000);
 
     // Write marks file
     const marksPath = join(sessionDir, "marks.txt");
@@ -284,7 +496,10 @@ async function createNarratedRecording(persona, pages) {
       .join("\n");
     writeFileSync(marksPath, marksContent);
 
-    // Finalize: Extract segments
+    // === POST-PROCESSING ===
+    console.error(`[narrator] === POST-PROCESSING ===`);
+
+    // Extract segments
     console.error(`[narrator] Extracting segments...`);
     const concatListPath = join(sessionDir, "concat_list.txt");
     let concatList = "";
@@ -294,12 +509,10 @@ async function createNarratedRecording(persona, pages) {
       const durationSec = (mark.durationMs / 1000).toFixed(3);
       const segmentPath = join(sessionDir, `segment_${mark.clipNum}.mp4`);
 
-      console.error(
-        `[narrator] Extracting segment ${mark.clipNum}: ${startSec}s for ${durationSec}s`
-      );
+      console.error(`[narrator] Extracting segment ${mark.clipNum}: ${startSec}s for ${durationSec}s`);
 
       execSync(
-        `ffmpeg -y -i "${recordingPath}" -ss ${startSec} -t ${durationSec} -c:v libx264 -preset fast -crf 23 "${segmentPath}" 2>/dev/null`
+        `ffmpeg -y -i "${videoPath}" -ss ${startSec} -t ${durationSec} -c:v libx264 -preset fast -crf 23 "${segmentPath}" 2>/dev/null`
       );
 
       concatList += `file '${segmentPath}'\n`;
@@ -373,8 +586,9 @@ async function createNarratedRecording(persona, pages) {
     };
   } catch (error) {
     console.error(`[narrator] Error: ${error.message}`);
+    // Try to clean up browser
     try {
-      await browser.close();
+      agentBrowser(`close`);
     } catch (e) {}
     throw error;
   }
@@ -384,7 +598,7 @@ async function createNarratedRecording(persona, pages) {
 const server = new Server(
   {
     name: "narrator-mcp-server",
-    version: "1.0.0",
+    version: "2.0.0",
   },
   {
     capabilities: {
@@ -400,14 +614,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "create_narrated_recording",
         description:
-          "Create a narrated screen recording of web pages. Opens a browser, visits each page, generates AI voice narration, records with smooth scrolling animation, and uploads the final video to Mux. Returns a playback URL.",
+          "Create a narrated screen recording of web pages. Uses a two-pass approach: first visits each page to analyze content and generate contextual narration using Claude, then records with smooth scrolling timed to the narration. Uploads final video to Mux and returns a playback URL.",
         inputSchema: {
           type: "object",
           properties: {
             persona: {
               type: "string",
               description:
-                'The persona/character for the narration style. Examples: "roast" (sarcastic critique), "interested prospect" (curious explorer), "noir detective" (dramatic storytelling), "excited intern" (enthusiastic), "caveman" (simple observations)',
+                'The persona/character for the narration style. Can be anything: "sarcastic tech reviewer", "Gordon Ramsay reviewing websites", "a confused grandparent", "overenthusiastic salesperson", etc.',
+            },
+            highlightDefaults: {
+              type: "object",
+              description: "Default settings for all highlights (can be overridden per-highlight)",
+              properties: {
+                style: {
+                  type: "string",
+                  enum: ["border", "pulse", "arrow", "zoom", "circle", "rectangle"],
+                  description: "Default highlight style"
+                },
+                linger: {
+                  type: "number",
+                  description: "Default linger time in seconds after phrase ends (default: 1.0)"
+                }
+              }
             },
             pages: {
               type: "array",
@@ -419,19 +648,88 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     type: "string",
                     description: "The URL to visit",
                   },
-                  narration: {
-                    type: "string",
-                    description:
-                      "The narration text for this page (will be converted to speech)",
+                  highlightDefaults: {
+                    type: "object",
+                    description: "Default highlight settings for this page (overrides global defaults)",
+                    properties: {
+                      style: { type: "string", enum: ["border", "pulse", "arrow", "zoom", "circle", "rectangle"] },
+                      linger: { type: "number" }
+                    }
                   },
+                  highlights: {
+                    type: "array",
+                    description: "Array of elements or regions to highlight, synced to narration timing",
+                    items: {
+                      type: "object",
+                      properties: {
+                        onText: {
+                          type: "string",
+                          description: "The phrase in the narration that triggers this highlight (used for timing)"
+                        },
+                        selector: {
+                          type: "string",
+                          description: "CSS selector for element-based highlights"
+                        },
+                        x: {
+                          type: "number",
+                          description: "X coordinate for coordinate-based highlights (circle, rectangle)"
+                        },
+                        y: {
+                          type: "number",
+                          description: "Y coordinate for coordinate-based highlights"
+                        },
+                        radius: {
+                          type: "number",
+                          description: "Radius for circle highlights (default: 50)"
+                        },
+                        width: {
+                          type: "number",
+                          description: "Width for rectangle highlights (default: 100)"
+                        },
+                        height: {
+                          type: "number",
+                          description: "Height for rectangle highlights (default: 60)"
+                        },
+                        style: {
+                          type: "string",
+                          enum: ["border", "pulse", "arrow", "zoom", "circle", "rectangle"],
+                          description: "Highlight style. Element-based: border, pulse, arrow, zoom. Coordinate-based: circle, rectangle"
+                        },
+                        linger: {
+                          type: "number",
+                          description: "How long to keep highlight visible after phrase ends (seconds)"
+                        }
+                      },
+                      required: ["onText"]
+                    }
+                  }
                 },
-                required: ["url", "narration"],
+                required: ["url"],
               },
             },
           },
           required: ["persona", "pages"],
         },
       },
+      {
+        name: "get_element_bounds",
+        description:
+          "Get the bounding box coordinates of a DOM element on a page. Useful for discovering coordinates for coordinate-based highlights (circle, rectangle).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            url: {
+              type: "string",
+              description: "The URL of the page to inspect"
+            },
+            selector: {
+              type: "string",
+              description: "CSS selector for the element"
+            }
+          },
+          required: ["url", "selector"]
+        }
+      }
     ],
   };
 });
@@ -442,7 +740,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (name === "create_narrated_recording") {
     try {
-      const result = await createNarratedRecording(args.persona, args.pages);
+      const result = await createNarratedRecording(args.persona, args.pages, args.highlightDefaults);
       return {
         content: [
           {
@@ -452,6 +750,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         ],
       };
     } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ error: error.message }, null, 2),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  if (name === "get_element_bounds") {
+    try {
+      agentBrowser(`open "${args.url}"`, { timeout: 60000 });
+      await sleep(1000);
+
+      const result = agentBrowser(`get box "${args.selector}" --json`);
+      agentBrowser(`close`);
+
+      const bounds = JSON.parse(result);
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(bounds, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      try {
+        agentBrowser(`close`);
+      } catch (e) {}
+
       return {
         content: [
           {
@@ -474,7 +807,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("[narrator] MCP server started");
+  console.error("[narrator] MCP server started (using agent-browser SDK)");
 }
 
 main().catch((error) => {
