@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { execSync, spawnSync } from "child_process";
-import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync } from "fs";
+import { writeFileSync, readFileSync, mkdirSync, existsSync, unlinkSync, appendFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -15,9 +15,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_DIR = dirname(__dirname);
 const SESSION_BASE = join(process.env.HOME, "Movies", "agent-recordings");
 
+const AGENT_BROWSER_BIN = 'agent-browser';
+
 // Helper to run agent-browser commands
 function agentBrowser(command, options = {}) {
-  const fullCommand = `agent-browser ${command}`;
+  console.error(`[narrator] Using agent-browser at: ${AGENT_BROWSER_BIN}`);
+  const fullCommand = `${AGENT_BROWSER_BIN} ${command}`;
   console.error(`[narrator] $ ${fullCommand}`);
   try {
     const result = execSync(fullCommand, {
@@ -56,12 +59,18 @@ function sleep(ms) {
 }
 
 // Generate narration using Claude API - returns structured data with scroll cues
-async function generateNarration(persona, pageUrl, snapshot) {
+async function generateNarration(persona, pageUrl, snapshot, refs) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
 
   if (!apiKey) {
     throw new Error("ANTHROPIC_API_KEY not set - required for auto-generating narration");
   }
+
+  // Build a list of refs with names for Claude to choose from
+  const refsWithNames = Object.entries(refs)
+    .filter(([id, info]) => info.name && info.role)
+    .map(([id, info]) => `${id}: ${info.role} "${info.name}"`)
+    .join('\n');
 
   const response = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -72,7 +81,7 @@ async function generateNarration(persona, pageUrl, snapshot) {
       "anthropic-beta": "structured-outputs-2025-11-13",
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-20250514",
+      model: "claude-sonnet-4-5-20250929",
       max_tokens: 800,
       messages: [
         {
@@ -81,8 +90,11 @@ async function generateNarration(persona, pageUrl, snapshot) {
 
 You are currently viewing: ${pageUrl}
 
-Here is the accessibility snapshot of the page (elements have ref IDs like @e1, @e5, @e12, etc.):
+Here is the accessibility snapshot of the page:
 ${snapshot}
+
+Here are the available element refs you can scroll to (only use refs from this list):
+${refsWithNames}
 
 Generate narration that flows naturally through the page from top to bottom. As you mention different parts of the page, we'll scroll to show them.
 
@@ -90,9 +102,9 @@ Guidelines:
 - Create 3-5 segments that flow naturally as one continuous narration
 - Each segment should be 1-2 sentences
 - Start at the top of the page and work your way down
-- IMPORTANT: Use refs from the snapshot above (like @e1, @e5, @e12) for scrollTo - these are guaranteed to exist
-- Pick refs that correspond to what you're talking about in that segment (e.g. if talking about a heading, use its ref)
-- Use 'top' for the first segment, then refs for subsequent sections as you scroll down
+- For scrollTo, use "top" for the first segment, then use ref IDs (e.g. "e13", "e83", "e121") for elements you want to scroll to
+- ONLY use ref IDs that appear in the list above - do not invent selectors
+- Pick refs for headings, sections, or landmarks that match what you're talking about
 - Keep it natural and conversational - this will be converted to speech
 - Stay in character throughout`,
         },
@@ -113,7 +125,7 @@ Guidelines:
                   },
                   scrollTo: {
                     type: "string",
-                    description: "Ref from the snapshot (e.g. @e1, @e5, @e12) or 'top'/'bottom'"
+                    description: "Element ref ID to scroll to (e.g. 'e13', 'e83') or 'top'/'bottom'. Must be from the provided refs list."
                   }
                 },
                 required: ["text", "scrollTo"],
@@ -136,7 +148,9 @@ Guidelines:
   const data = await response.json();
 
   // With structured outputs, the response is guaranteed to be valid JSON
-  return JSON.parse(data.content[0].text);
+  const narrationData = JSON.parse(data.content[0].text);
+
+  return narrationData;
 }
 
 // Calculate segment start times based on character positions in the full text
@@ -307,6 +321,14 @@ async function createNarratedRecording(persona, pages, globalHighlightDefaults) 
   console.error(`[narrator] Persona: ${persona}`);
   console.error(`[narrator] Pages: ${pages.length}`);
 
+  // Create debug log file
+  const debugLogPath = join(sessionDir, "debug.log");
+  const logDebug = (msg) => {
+    const line = `[${new Date().toISOString()}] ${msg}\n`;
+    console.error(`[narrator] ${msg}`);
+    appendFileSync(debugLogPath, line);
+  };
+
   // Video output path
   const videoPath = join(sessionDir, "recording.webm");
   const clips = [];
@@ -333,16 +355,24 @@ async function createNarratedRecording(persona, pages, globalHighlightDefaults) 
         await sleep(2000);
       }
 
-      // Get snapshot of the page
+      // Get snapshot of the page with refs
       console.error(`[narrator] Taking snapshot...`);
-      const snapshot = agentBrowser(`snapshot`);
+      const snapshotJson = agentBrowser(`snapshot --json`);
+
+      // Parse JSON from output (skip any leading text/status lines)
+      const jsonStart = snapshotJson.indexOf('{');
+      const snapshotData = JSON.parse(snapshotJson.substring(jsonStart));
+      const snapshot = snapshotData.data.snapshot;
+      const refs = snapshotData.data.refs;
+
+      logDebug(`Snapshot has ${Object.keys(refs).length} refs`);
 
       // Generate narration
-      console.error(`[narrator] Generating narration with Claude...`);
-      const narrationData = await generateNarration(persona, page.url, snapshot);
-      console.error(`[narrator] Generated ${narrationData.segments.length} segments`);
+      logDebug(`Generating narration with Claude...`);
+      const narrationData = await generateNarration(persona, page.url, snapshot, refs);
+      logDebug(`Generated ${narrationData.segments.length} segments`);
       for (const seg of narrationData.segments) {
-        console.error(`[narrator]   - "${seg.text.substring(0, 50)}..." -> ${seg.scrollTo}`);
+        logDebug(`  Segment: "${seg.text.substring(0, 50)}..." -> scrollTo: ${seg.scrollTo}`);
       }
 
       pageData.push({
@@ -421,12 +451,14 @@ async function createNarratedRecording(persona, pages, globalHighlightDefaults) 
       marks.push({ clipNum, offsetMs, durationMs: clip.durationMs });
       console.error(`[narrator] Marked clip ${clipNum} at offset ${offsetMs}ms`);
 
-      // Enable smooth scrolling
+      // Enable smooth scrolling and log page dimensions
       agentBrowser(`eval "document.documentElement.style.scrollBehavior = 'smooth'"`);
+      const pageDimensions = agentBrowser(`eval "JSON.stringify({ scrollHeight: document.body.scrollHeight, viewportHeight: window.innerHeight, scrollable: document.body.scrollHeight > window.innerHeight })"`);
+      logDebug(`Page dimensions: ${pageDimensions}`);
 
       // Content-aware scrolling based on segment timings
       if (clip.segmentTimings && clip.segmentTimings.length > 0) {
-        console.error(`[narrator] Using content-aware scrolling with ${clip.segmentTimings.length} segments`);
+        logDebug(`Using content-aware scrolling with ${clip.segmentTimings.length} segments`);
 
         const segmentStartTime = Date.now();
 
@@ -441,25 +473,23 @@ async function createNarratedRecording(persona, pages, globalHighlightDefaults) 
             await sleep(waitMs);
           }
 
-          console.error(`[narrator] Scrolling to: ${targetScrollTo}`);
+          logDebug(`Scrolling to: ${targetScrollTo} at ${segment.startTimeSec.toFixed(2)}s`);
 
           // Scroll to the target element/position
           if (targetScrollTo === 'top') {
+            logDebug(`Scrolling to top of page`);
             agentBrowser(`eval "window.scrollTo({ top: 0, behavior: 'smooth' })"`);
           } else if (targetScrollTo === 'bottom') {
+            logDebug(`Scrolling to bottom of page`);
             agentBrowser(`eval "window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' })"`);
-          } else if (targetScrollTo.startsWith('@')) {
-            // Use ref-based scrolling (guaranteed to exist from snapshot)
-            try {
-              agentBrowser(`scrollintoview ${targetScrollTo}`);
-            } catch (e) {
-              console.error(`[narrator] Failed to scroll to ref ${targetScrollTo}: ${e.message}`);
-            }
           } else {
-            // Fallback: try CSS selector (less reliable)
-            console.error(`[narrator] Warning: using CSS selector fallback for: ${targetScrollTo}`);
-            const escapedSelector = targetScrollTo.replace(/"/g, '\\"').replace(/'/g, "\\'");
-            agentBrowser(`eval "const el = document.querySelector('${escapedSelector}'); if (el) { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }"`);
+            // Use scrollintoview with ref directly
+            try {
+              agentBrowser(`scrollintoview @${targetScrollTo}`);
+              logDebug(`Scrolled to ref @${targetScrollTo}`);
+            } catch (e) {
+              logDebug(`Failed to scroll to ref @${targetScrollTo}: ${e.message}`);
+            }
           }
         }
 
@@ -471,7 +501,7 @@ async function createNarratedRecording(persona, pages, globalHighlightDefaults) 
         }
       } else {
         // Fallback: simple timed scroll if no segment timings
-        console.error(`[narrator] Using fallback scrolling (no segment timings)`);
+        logDebug(`WARNING: Using fallback scrolling (no segment timings available)`);
         await sleep(clip.durationMs);
       }
 
